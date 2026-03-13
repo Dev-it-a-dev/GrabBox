@@ -942,14 +942,7 @@ async function resolveFileUrl(file) {
     } catch(e) { /* */ }
   }
 
-  // Last resort: derive from thumb
-  if (file.thumb) {
-    const cdnUrl = file.thumb.replace('/thumbs/', '/files/').replace('.webp', '.' + (file.name.split('.').pop() || 'jpg'));
-    file.directUrl = cdnUrl;
-    return cdnUrl;
-  }
-
-  throw new Error('Could not resolve download URL');
+  throw new Error('Could not resolve download URL — try configuring a Download Worker');
 }
 
 function xorDecrypt(encoded, key) {
@@ -1199,41 +1192,56 @@ function renderLightbox() {
   document.getElementById('lbCounter').textContent = `${lbIndex + 1} / ${filteredFiles.length}`;
 
   const container = document.getElementById('lbContent');
-  // Keep nav buttons, replace media
   const navPrev = container.querySelector('.lb-prev');
   const navNext = container.querySelector('.lb-next');
-  // Remove old media
   const oldMedia = container.querySelector('.lb-media');
   if (oldMedia) oldMedia.remove();
 
-  let mediaEl;
+  const capturedIndex = lbIndex; // capture for async check
+
   if (file.type === 'video') {
-    mediaEl = document.createElement('video');
+    const mediaEl = document.createElement('video');
     mediaEl.className = 'lb-media';
     mediaEl.controls = true;
     mediaEl.autoplay = false;
     mediaEl.playsInline = true;
     mediaEl.preload = 'metadata';
-    // Use thumb as poster
     if (file.thumb) mediaEl.poster = file.thumb;
-    // Try to set a source — use direct URL if resolved, otherwise thumb-derived or page URL
-    const src = file.directUrl || (file.thumb ? file.thumb.replace('/thumbs/', '/files/').replace('.webp', '.' + file.name.split('.').pop()) : '');
-    if (src) mediaEl.src = src;
+    container.insertBefore(mediaEl, navPrev);
+
+    // Resolve full URL for video src
+    if (file.directUrl) {
+      mediaEl.src = buildWorkerMediaUrl(file.directUrl, file._referer);
+    } else {
+      resolveFileUrl(file).then(url => {
+        if (lbIndex === capturedIndex) mediaEl.src = buildWorkerMediaUrl(url, file._referer);
+      }).catch(() => {});
+    }
   } else {
-    mediaEl = document.createElement('img');
+    const mediaEl = document.createElement('img');
     mediaEl.className = 'lb-media';
-    // Use full-size if direct URL is resolved, otherwise thumb
-    mediaEl.src = file.directUrl || file.thumb || '';
     mediaEl.alt = file.name;
-    mediaEl.onerror = function() {
-      // If full-size fails, fall back to thumb
-      if (file.thumb && this.src !== file.thumb) this.src = file.thumb;
-    };
+
+    // Show thumb immediately as placeholder
+    if (file.thumb) mediaEl.src = file.thumb;
+    container.insertBefore(mediaEl, navPrev);
+
+    // Resolve and swap to full-res
+    if (file.directUrl) {
+      const fullSrc = buildWorkerMediaUrl(file.directUrl, file._referer);
+      if (fullSrc !== file.thumb) loadFullRes(mediaEl, fullSrc, file.thumb);
+    } else {
+      resolveFileUrl(file).then(url => {
+        if (lbIndex !== capturedIndex) return; // user navigated away
+        const fullSrc = buildWorkerMediaUrl(url, file._referer);
+        loadFullRes(mediaEl, fullSrc, file.thumb);
+      }).catch(() => {
+        // Keep thumb as fallback
+      });
+    }
   }
 
-  container.insertBefore(mediaEl, navPrev);
-
-  // Dots (show a window of ~30 dots around current)
+  // Dots
   const dotsContainer = document.getElementById('lbDots');
   const total = filteredFiles.length;
   if (total <= 40) {
@@ -1241,9 +1249,32 @@ function renderLightbox() {
       `<div class="lb-dot ${i === lbIndex ? 'active' : ''}" onclick="lbJump(${i})"></div>`
     ).join('');
   } else {
-    // For very large albums, show simplified counter only
     dotsContainer.innerHTML = '';
   }
+}
+
+// Build a URL that routes through the worker if available (for full-res images/videos)
+function buildWorkerMediaUrl(directUrl, referer) {
+  const worker = getWorkerUrl();
+  if (worker) {
+    const params = new URLSearchParams({ url: directUrl });
+    if (referer) params.set('referer', referer);
+    return `${worker}?${params}`;
+  }
+  return directUrl;
+}
+
+// Load full-res image and swap it in, keeping thumb as fallback
+function loadFullRes(imgEl, fullSrc, thumbSrc) {
+  const testImg = new Image();
+  testImg.onload = function() {
+    imgEl.src = fullSrc;
+  };
+  testImg.onerror = function() {
+    // Full-res failed, keep the thumb
+    if (thumbSrc && imgEl.src !== thumbSrc) imgEl.src = thumbSrc;
+  };
+  testImg.src = fullSrc;
 }
 
 function lbJump(index) {
