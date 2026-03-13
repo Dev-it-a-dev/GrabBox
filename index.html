@@ -890,12 +890,16 @@ input[type="checkbox"] {
     <div class="proxy-config">
       <label>CORS Proxy:</label>
       <select class="proxy-select" id="proxySelect">
-        <option value="https://api.codetabs.com/v1/proxy?quest=">codetabs</option>
         <option value="https://corsproxy.io/?url=">corsproxy.io</option>
         <option value="https://api.allorigins.win/raw?url=">allorigins</option>
+        <option value="https://api.codetabs.com/v1/proxy?quest=">codetabs</option>
         <option value="custom">custom…</option>
       </select>
       <input type="text" class="url-input" id="customProxy" style="display:none;max-width:280px;min-height:34px;font-size:0.75rem" placeholder="https://your-proxy.com/?url=">
+      <label style="margin-left:8px" title="Try without proxy for downloads if CDN allows direct access">
+        <input type="checkbox" id="tryDirectDownload" checked style="width:15px;height:15px;vertical-align:middle">
+        <span style="font-family:var(--font-mono);font-size:0.72rem;color:var(--text-muted)">Try direct download first</span>
+      </label>
     </div>
   </section>
 
@@ -1104,11 +1108,8 @@ async function startFetch() {
 }
 
 async function fetchAlbum(urlInfo) {
-  const proxy = getProxyUrl();
   const targetUrl = `${urlInfo.domain}/a/${urlInfo.albumId}`;
-  const fetchUrl = proxy + encodeURIComponent(targetUrl);
-
-  const resp = await fetch(fetchUrl);
+  const resp = await fetchWithFallback(targetUrl, { expectHtml: true });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const html = await resp.text();
 
@@ -1482,6 +1483,67 @@ function updateSelectionBar() {
 //  DOWNLOAD LOGIC
 // ============================
 
+// Try to fetch a URL, with fallback strategies
+async function fetchWithFallback(url, options = {}) {
+  const tryDirect = document.getElementById('tryDirectDownload').checked;
+  const proxy = getProxyUrl();
+  const errors = [];
+
+  // Strategy 1: Direct fetch (no proxy) — works if CDN has permissive CORS
+  if (tryDirect) {
+    try {
+      const resp = await fetch(url, { mode: 'cors', ...options });
+      if (resp.ok) {
+        const contentType = resp.headers.get('content-type') || '';
+        // Verify we didn't get an HTML error page instead of the real file
+        if (!contentType.includes('text/html') || options.expectHtml) {
+          return resp;
+        }
+      }
+    } catch(e) {
+      errors.push(`Direct: ${e.message}`);
+    }
+  }
+
+  // Strategy 2: corsproxy.io (most reliable for binary)
+  if (proxy.includes('corsproxy.io')) {
+    try {
+      const resp = await fetch(proxy + encodeURIComponent(url), options);
+      if (resp.ok) return resp;
+      errors.push(`corsproxy: HTTP ${resp.status}`);
+    } catch(e) {
+      errors.push(`corsproxy: ${e.message}`);
+    }
+  }
+
+  // Strategy 3: Selected proxy
+  try {
+    const resp = await fetch(proxy + encodeURIComponent(url), options);
+    if (resp.ok) return resp;
+    errors.push(`Proxy: HTTP ${resp.status}`);
+  } catch(e) {
+    errors.push(`Proxy: ${e.message}`);
+  }
+
+  // Strategy 4: Try other proxies as fallback
+  const fallbackProxies = [
+    'https://corsproxy.io/?url=',
+    'https://api.allorigins.win/raw?url=',
+    'https://api.codetabs.com/v1/proxy?quest=',
+  ].filter(p => p !== proxy);
+
+  for (const fp of fallbackProxies) {
+    try {
+      const resp = await fetch(fp + encodeURIComponent(url), options);
+      if (resp.ok) return resp;
+    } catch(e) {
+      errors.push(`Fallback ${fp.split('/')[2]}: ${e.message}`);
+    }
+  }
+
+  throw new Error('All download methods failed: ' + errors.join('; '));
+}
+
 // Resolve file's direct download URL
 async function resolveFileUrl(file) {
   if (file.directUrl) return file.directUrl;
@@ -1490,24 +1552,39 @@ async function resolveFileUrl(file) {
   if (file.dataId && file.provider) {
     try {
       const apiUrl = file.provider.apiEndpoint;
-      const referer = file.provider.refererBase + file.dataId;
       const proxy = getProxyUrl();
 
-      const resp = await fetch(proxy + encodeURIComponent(apiUrl), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: file.dataId }),
-      });
+      // POST through proxy — try corsproxy.io first (best POST support)
+      const postProxies = [
+        'https://corsproxy.io/?url=',
+        proxy,
+        'https://api.allorigins.win/raw?url=',
+      ];
 
-      if (resp.ok) {
-        const data = await resp.json();
-        let url = data.url;
-        if (data.encrypted) {
-          const key = 'SECRET_KEY_' + String(Math.floor(data.timestamp / 3600));
-          url = xorDecrypt(url, key);
+      for (const pp of postProxies) {
+        try {
+          const resp = await fetch(pp + encodeURIComponent(apiUrl), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: file.dataId }),
+          });
+          if (resp.ok) {
+            const text = await resp.text();
+            // Guard: check we got JSON back, not an HTML error page
+            if (text.trim().startsWith('{') || text.trim().startsWith('[')) {
+              const data = JSON.parse(text);
+              let url = data.url;
+              if (data.encrypted) {
+                const key = 'SECRET_KEY_' + String(Math.floor(data.timestamp / 3600));
+                url = xorDecrypt(url, key);
+              }
+              file.directUrl = url;
+              return url;
+            }
+          }
+        } catch(e) {
+          console.warn(`API via ${pp.split('/')[2]} failed:`, e.message);
         }
-        file.directUrl = url;
-        return url;
       }
     } catch(e) {
       console.warn('API resolve failed for', file.dataId, e);
@@ -1517,11 +1594,10 @@ async function resolveFileUrl(file) {
   // Fallback: try to fetch the file page and extract the direct URL
   if (file.pageUrl) {
     try {
-      const proxy = getProxyUrl();
-      const resp = await fetch(proxy + encodeURIComponent(file.pageUrl));
+      const resp = await fetchWithFallback(file.pageUrl, { expectHtml: true });
       const html = await resp.text();
-      // Look for download link or source
-      const srcMatch = html.match(/(?:href|src)="(https?:\/\/[^"]*(?:cdn|media-files|burger)[^"]*)"/);
+      // Look for download link or source — CDN patterns
+      const srcMatch = html.match(/(?:href|src)="(https?:\/\/[^"]*(?:cdn|media-files|burger|files\.)[^"]*)"/);
       if (srcMatch) {
         file.directUrl = srcMatch[1];
         return srcMatch[1];
@@ -1530,6 +1606,7 @@ async function resolveFileUrl(file) {
       const fileIdMatch = html.match(/data-file-id="(\d+)"/);
       if (fileIdMatch) {
         file.dataId = fileIdMatch[1];
+        file.provider = file.provider || providers[0]; // default to first provider
         return resolveFileUrl(file); // Recurse with dataId
       }
     } catch(e) {
@@ -1537,12 +1614,21 @@ async function resolveFileUrl(file) {
     }
   }
 
+  // Last resort: try constructing URL from thumbnail
+  if (file.thumb) {
+    // Thumbnails often follow pattern: thumbs/UUID.webp → files/UUID.ext
+    const cdnUrl = file.thumb
+      .replace('/thumbs/', '/files/')
+      .replace('.webp', '.' + (file.name.split('.').pop() || 'jpg'));
+    file.directUrl = cdnUrl;
+    return cdnUrl;
+  }
+
   throw new Error('Could not resolve download URL');
 }
 
 function xorDecrypt(encoded, key) {
   const keyBytes = new TextEncoder().encode(key);
-  // The encoded string is base64
   try {
     const decoded = atob(encoded);
     let result = '';
@@ -1551,26 +1637,79 @@ function xorDecrypt(encoded, key) {
     }
     return result;
   } catch(e) {
-    return encoded; // If not base64, return as-is
+    return encoded;
   }
 }
 
-async function downloadBlob(url, filename) {
-  const proxy = getProxyUrl();
-  const resp = await fetch(proxy + encodeURIComponent(url));
-  if (!resp.ok) throw new Error(`Download failed: HTTP ${resp.status}`);
+// Download a file as blob with proper content type handling
+async function downloadFileAsBlob(url, filename) {
+  const resp = await fetchWithFallback(url);
   const blob = await resp.blob();
-  triggerBlobDownload(blob, filename);
-  return blob;
+
+  // Validate the blob is real content, not an HTML error page
+  if (blob.type && blob.type.includes('text/html') && blob.size < 5000) {
+    // Likely an error page from the proxy, not the actual file
+    const text = await blob.text();
+    if (text.includes('<!DOCTYPE') || text.includes('<html')) {
+      throw new Error('Received HTML error page instead of file');
+    }
+  }
+
+  // Fix MIME type if proxy stripped it — infer from filename
+  let finalBlob = blob;
+  if (!blob.type || blob.type === 'application/octet-stream' || blob.type === 'text/plain') {
+    const ext = filename.split('.').pop().toLowerCase();
+    const mimeMap = {
+      'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
+      'gif': 'image/gif', 'webp': 'image/webp', 'avif': 'image/avif',
+      'bmp': 'image/bmp', 'svg': 'image/svg+xml', 'ico': 'image/x-icon',
+      'mp4': 'video/mp4', 'webm': 'video/webm', 'mkv': 'video/x-matroska',
+      'avi': 'video/x-msvideo', 'mov': 'video/quicktime', 'wmv': 'video/x-ms-wmv',
+      'flv': 'video/x-flv', 'm4v': 'video/x-m4v', 'ts': 'video/mp2t',
+      'mpg': 'video/mpeg', 'mpeg': 'video/mpeg', '3gp': 'video/3gpp',
+      'zip': 'application/zip', 'rar': 'application/x-rar-compressed',
+    };
+    const correctType = mimeMap[ext];
+    if (correctType) {
+      finalBlob = new Blob([blob], { type: correctType });
+    }
+  }
+
+  return finalBlob;
 }
 
+// Trigger download — with Samsung/mobile browser compatibility
 function triggerBlobDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+
+  // Method 1: Standard anchor click
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
+  a.href = url;
   a.download = filename;
+  a.style.display = 'none';
   document.body.appendChild(a);
-  a.click();
-  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+
+  // Samsung Internet and some mobile browsers need a delay
+  setTimeout(() => {
+    a.click();
+    // Cleanup after generous delay for mobile
+    setTimeout(() => {
+      URL.revokeObjectURL(url);
+      a.remove();
+    }, 5000);
+  }, 100);
+}
+
+// Open in new tab as fallback for browsers that block blob downloads
+function triggerOpenDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  // For mobile: open in new window, user can long-press to save
+  const w = window.open(url, '_blank');
+  if (!w) {
+    // Popup blocked — fall back to anchor method
+    triggerBlobDownload(blob, filename);
+  }
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 
 // Download single file
@@ -1583,12 +1722,14 @@ async function downloadSingle(id) {
 
   try {
     const url = await resolveFileUrl(file);
-    await downloadBlob(url, file.name);
+    const blob = await downloadFileAsBlob(url, file.name);
+    triggerBlobDownload(blob, file.name);
     updateQueueItem(file.id, 'done');
     toast(`Downloaded: ${file.name}`, 'success');
   } catch(e) {
     updateQueueItem(file.id, 'error');
     toast(`Failed: ${file.name} — ${e.message}`, 'error');
+    console.error('Download error for', file.name, e);
   }
 }
 
@@ -1623,20 +1764,30 @@ async function downloadAll(typeFilter) {
 
 async function downloadSequential(files) {
   showQueue(files);
+  let doneCount = 0;
+  let errCount = 0;
+
   for (const file of files) {
     updateQueueItem(file.id, 'downloading');
     try {
       const url = await resolveFileUrl(file);
-      await downloadBlob(url, file.name);
+      const blob = await downloadFileAsBlob(url, file.name);
+      triggerBlobDownload(blob, file.name);
       updateQueueItem(file.id, 'done');
+      doneCount++;
     } catch(e) {
       updateQueueItem(file.id, 'error');
-      console.error('Download error:', e);
+      errCount++;
+      console.error('Download error:', file.name, e);
     }
-    // Small delay between downloads
-    await new Promise(r => setTimeout(r, 500));
+    // Longer delay on mobile to avoid overwhelming the browser
+    await new Promise(r => setTimeout(r, 800));
   }
-  toast(`Finished downloading ${files.length} file(s)`, 'success');
+
+  const msg = errCount > 0
+    ? `Done: ${doneCount} downloaded, ${errCount} failed`
+    : `Finished downloading ${doneCount} file(s)`;
+  toast(msg, errCount > 0 ? 'error' : 'success');
   updateQueueTitle('Complete');
 }
 
@@ -1644,24 +1795,29 @@ async function downloadAsZip(files) {
   showQueue(files);
   const zip = new JSZip();
   let completed = 0;
+  let errCount = 0;
 
   for (const file of files) {
     updateQueueItem(file.id, 'downloading');
-    updateQueueTitle(`Zipping ${completed}/${files.length}`);
+    updateQueueTitle(`Fetching ${completed + 1}/${files.length}`);
     try {
       const url = await resolveFileUrl(file);
-      const proxy = getProxyUrl();
-      const resp = await fetch(proxy + encodeURIComponent(url));
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const blob = await resp.blob();
+      const blob = await downloadFileAsBlob(url, file.name);
       zip.file(file.name, blob);
       updateQueueItem(file.id, 'done');
       completed++;
     } catch(e) {
       updateQueueItem(file.id, 'error');
-      console.error('Zip add error:', e);
+      errCount++;
+      console.error('Zip add error:', file.name, e);
     }
-    await new Promise(r => setTimeout(r, 300));
+    await new Promise(r => setTimeout(r, 400));
+  }
+
+  if (completed === 0) {
+    toast('No files could be fetched for ZIP', 'error');
+    updateQueueTitle('Failed');
+    return;
   }
 
   updateQueueTitle('Generating ZIP…');
@@ -1670,11 +1826,16 @@ async function downloadAsZip(files) {
       updateQueueTitle(`Compressing: ${Math.round(metadata.percent)}%`);
     });
     const albumName = files[0]?.albumTitle || 'grabbox_download';
-    triggerBlobDownload(content, `${albumName}.zip`);
-    toast(`ZIP downloaded: ${albumName}.zip (${files.length} files)`, 'success');
+    const zipName = `${albumName.replace(/[^a-zA-Z0-9_\-. ]/g, '_')}.zip`;
+    triggerBlobDownload(content, zipName);
+    const msg = errCount > 0
+      ? `ZIP saved: ${zipName} (${completed}/${files.length} files, ${errCount} failed)`
+      : `ZIP saved: ${zipName} (${completed} files)`;
+    toast(msg, errCount > 0 ? 'error' : 'success');
     updateQueueTitle('Complete');
   } catch(e) {
     toast('Failed to generate ZIP: ' + e.message, 'error');
+    updateQueueTitle('ZIP failed');
   }
 }
 
