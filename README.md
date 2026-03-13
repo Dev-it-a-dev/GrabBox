@@ -8,81 +8,85 @@ A 100% client-side web tool for browsing and downloading files from album and ga
 
 ## Features
 
-- **Paste & Fetch** — Paste one or more album URLs from supported sites, the tool fetches and parses them via a CORS proxy
-- **File Browser** — Table view (data-dense) or Grid view (visual thumbnails), toggle freely
-- **Filter & Search** — Type filters (Image / Video / Other) + live text search by filename
+- **Paste & Fetch** — Paste one or more album URLs, fetched via CORS proxy with `?advanced=1` for full file listing (no pagination misses)
+- **3 View Modes** — Table (data-dense), Grid (visual cards), Gallery (full-screen lightbox with swipe/keyboard navigation)
+- **Filter & Search** — Type chips (Image / Video / Other) + live text search by filename
 - **Sort** — Click column headers to sort by name, type, or file size
-- **Download individual** — One-click download for any single file
-- **Download selected** — Check multiple files, then download individually or as a single ZIP
-- **Bulk download** — Download all images, all videos, or all files at once (auto-ZIPs for 5+)
-- **Multi-album support** — Paste several album URLs and browse them all in one unified list
-- **Pluggable providers** — Extensible architecture for adding new hosting sites easily
-- **Keyboard shortcuts** — `Ctrl+A` to select all, `Escape` to clear selection
+- **Download** — Individual, multi-select, or bulk (all images / all videos / everything)
+- **ZIP packaging** — Client-side ZIP via JSZip for bulk downloads
+- **Export Links** — Resolve direct download URLs and copy/save as `.txt` for use with wget, aria2, JDownloader
+- **Cloudflare Worker** — Optional tiny proxy (~60 lines) that sets the required Referer header for CDNs with anti-hotlinking
+- **Multi-album** — Paste several URLs, browse all in one unified list
+- **Pluggable providers** — Easy to add new hosting sites
+- **Mobile-first** — Touch targets, swipe gallery, responsive layout
+- **Keyboard shortcuts** — `Ctrl+A` select all, `Escape` deselect, `←/→` gallery navigation
 
-## How It Works
+## Download Strategies
 
-1. You paste album/gallery URLs from supported hosting sites
-2. The app fetches each page through a CORS proxy (you choose which proxy to use)
-3. It parses the page HTML to extract file metadata (name, size, type, thumbnails)
-4. Files are displayed in a filterable, sortable list
-5. Downloads are fetched through the CORS proxy and saved via the browser's download API
-6. ZIP packaging is done client-side with JSZip
+GrabBox tries multiple download methods in order:
 
-## Adding New Providers
+| Priority | Method | When it works |
+|----------|--------|---------------|
+| 1 | **Cloudflare Worker** | Always (sets correct Referer header) |
+| 2 | **Direct fetch** | When CDN allows CORS |
+| 3 | **CORS proxy** | When CDN doesn't check Referer |
+| 4 | **Export links** | Always (manual download via external tool) |
 
-The app uses a pluggable provider system. Each provider is an object in the `providers` array with:
+### Setting up the Cloudflare Worker (recommended)
 
-```js
-{
-  name: 'sitename',
-  match: (url) => { /* return { albumId, domain } or null */ },
-  thumbBase: (uuid) => `https://.../${uuid}.webp`,  // optional
-  apiEndpoint: 'https://...',                        // optional
-  refererBase: 'https://...',                        // optional
-}
+The Worker is needed because most CDNs require a `Referer` header that browsers can't set from JS.
+
+1. Go to [Cloudflare Workers](https://workers.cloudflare.com/) — free account, no credit card
+2. Create a new Worker
+3. Paste the contents of `worker.js` from this repo
+4. Deploy — you get a URL like `https://grabbox-dl.yourname.workers.dev`
+5. Paste that URL into GrabBox's "Download Worker" field
+
+Free tier: 100,000 requests/day. More than enough for personal use.
+
+### Without the Worker
+
+If you don't deploy a Worker, GrabBox will still:
+- Try direct downloads (works for some CDNs)
+- Try CORS proxy downloads (works when no Referer check)
+- Let you **Export Links** as a text list to use with wget/aria2/JDownloader
+
+## Files
+
 ```
-
-To add support for a new site, add a provider object to the array and implement the appropriate parsing logic in the `parseAlbumHtml` function (or create a site-specific parser).
-
-## CORS Proxies
-
-Since this runs on GitHub Pages (static hosting), it needs a CORS proxy to fetch pages. Built-in options:
-
-| Proxy | URL |
-|-------|-----|
-| **codetabs** | `api.codetabs.com/v1/proxy` |
-| **corsproxy.io** | `corsproxy.io` |
-| **allorigins** | `api.allorigins.win` |
-| **Custom** | Enter your own proxy URL |
-
-> **Tip:** If one proxy is slow or rate-limited, switch to another. You can also deploy your own CORS proxy for reliability (e.g. [cors-anywhere](https://github.com/Rob--W/cors-anywhere) on a free Cloudflare Worker).
+index.html   ← The complete app (single file, deploy anywhere)
+worker.js    ← Cloudflare Worker source (optional, for reliable downloads)
+README.md    ← This file
+```
 
 ## Deployment
 
-### GitHub Pages (recommended)
-
-1. Fork this repo (or create a new one)
-2. Drop `index.html` into the root
-3. Go to **Settings → Pages → Source: main branch**
-4. Your tool is live at `https://yourusername.github.io/grabbox/`
+### GitHub Pages
+1. Push `index.html` to any repo
+2. Settings → Pages → Source: main branch
+3. Live at `https://yourusername.github.io/grabbox/`
 
 ### Local
+Open `index.html` in any browser.
 
-Just open `index.html` in any modern browser. That's it.
+## Adding New Providers
 
-## Limitations
-
-- **CORS proxy dependency** — Free public proxies may be rate-limited, slow, or go offline. For heavy use, self-host a proxy.
-- **Sites change frequently** — Domains rotate, page structures evolve, API endpoints shift. The parsers handle current known structures but may need updates.
-- **Large files** — Downloading very large videos through a CORS proxy can be slow or time out. Consider a dedicated downloader for files over ~500MB.
-- **No authentication** — This tool doesn't handle accounts or password-protected albums.
+```js
+providers.push({
+  name: 'sitename',
+  match: (url) => { /* return { albumId, domain } or null */ },
+  thumbBase: (uuid) => `https://.../${uuid}.webp`,
+  apiEndpoint: 'https://...',
+  refererBase: 'https://...',
+});
+```
 
 ## Tech Stack
 
-- Vanilla HTML/CSS/JS — zero build step
-- [JSZip](https://stuk.github.io/jszip/) — client-side ZIP creation
+- Vanilla HTML/CSS/JS — zero build step, single file
+- [JSZip](https://stuk.github.io/jszip/) — client-side ZIP
 - Google Fonts — JetBrains Mono, DM Sans, Space Grotesk
 
 ## License
 
-MIT — do whatever you want with it.
+MIT
