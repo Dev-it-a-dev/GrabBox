@@ -2,7 +2,7 @@
 
 A 100% client-side web tool for browsing and downloading files from album and gallery hosting sites. Runs entirely in your browser — no server, no backend, no data stored anywhere.
 
-**[→ Live Demo on GitHub Pages](https://dev-it-a-dev.github.io/grabbox/)**
+**[→ Live Demo on GitHub Pages](https://dev-it-a-dev.github.io/GrabBox/)**
 
 ---
 
