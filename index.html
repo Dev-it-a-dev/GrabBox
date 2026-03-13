@@ -715,8 +715,8 @@ function parseAlbumFileEntry(entry, urlInfo, albumTitle) {
   const sizeMatch = entry.match(/size:\s*(\d+)/);
   const uuidMatch = entry.match(/name:\s*"([^"]+)"/);
   if (!idMatch) return null;
-  const dataId = idMatch[1];
-  const rawName = nameMatch ? nameMatch[1].replace(/\\'/g, "'") : (slugMatch ? slugMatch[1] : dataId);
+  const albumItemId = idMatch[1]; // This is the album-level ID, NOT the file-level data-file-id
+  const rawName = nameMatch ? nameMatch[1].replace(/\\'/g, "'") : (slugMatch ? slugMatch[1] : albumItemId);
   const slug = slugMatch ? slugMatch[1].replace(/\\'/g, "'") : rawName;
   const size = sizeMatch ? parseInt(sizeMatch[1]) : 0;
   const uuid = uuidMatch ? uuidMatch[1] : null;
@@ -725,9 +725,11 @@ function parseAlbumFileEntry(entry, urlInfo, albumTitle) {
   if (uuid && (type === 'image' || type === 'video') && urlInfo.provider && urlInfo.provider.thumbBase) {
     thumb = urlInfo.provider.thumbBase(uuid);
   }
+  // Build the individual file page URL — this is where we'll find the real data-file-id
+  const filePageUrl = `${urlInfo.domain}/f/${slug}`;
   return {
-    id: generateId(), dataId, name: rawName, slug, type, size, sizeFormatted: formatSize(size),
-    thumb, pageUrl: null, directUrl: null, albumId: urlInfo.albumId, albumTitle,
+    id: generateId(), dataId: null, slug, name: rawName, type, size, sizeFormatted: formatSize(size),
+    thumb, pageUrl: filePageUrl, directUrl: null, albumId: urlInfo.albumId, albumTitle,
     domain: urlInfo.domain, provider: urlInfo.provider,
   };
 }
@@ -898,25 +900,119 @@ function updateSelectionBar() {
 }
 
 // ==================== RESOLVE DOWNLOAD URL ====================
+// Resolution flow:
+// 1. Fetch individual file page (/f/{slug}) to get the real data-file-id
+// 2. POST data-file-id to API endpoint → get CDN URL
+// 3. CDN URL requires Referer header (handled by Worker)
+
 async function resolveFileUrl(file) {
   if (file.directUrl) return file.directUrl;
 
-  // Try provider API
+  // Step 1: If we don't have the real data-file-id yet, fetch the individual file page
+  if (!file.dataId && file.pageUrl) {
+    try {
+      const html = await fetchFilePage(file);
+      // Extract data-file-id from the file page
+      const fileIdMatch = html.match(/data-file-id="([^"]+)"/);
+      if (fileIdMatch) {
+        file.dataId = fileIdMatch[1];
+      }
+      // Also look for direct CDN links on the file page as a fallback
+      if (!file.dataId) {
+        const directMatch = html.match(/(?:href|src)="(https?:\/\/[^"]*(?:cdn|media-files|burger|gigachad|bunkr-cache|cheese|sushi|bacon|maple|beer|rice|cake|rum|wings|pad|soup)[^"]*)"/);
+        if (directMatch) {
+          file.directUrl = directMatch[1];
+          file._referer = (file.provider && file.provider.refererBase) ? file.provider.refererBase + (file.slug || '') : file.pageUrl;
+          return file.directUrl;
+        }
+      }
+    } catch(e) {
+      console.warn('File page fetch failed for', file.name, e.message);
+    }
+  }
+
+  // Step 2: Use data-file-id with the API to get the real CDN URL
   if (file.dataId && file.provider && file.provider.apiEndpoint) {
-    const apiUrl = file.provider.apiEndpoint;
-    const postProxies = ['https://corsproxy.io/?url=', getProxyUrl(), 'https://api.allorigins.win/raw?url='];
-    const unique = [...new Set(postProxies)];
-    for (const pp of unique) {
-      try {
-        const resp = await fetch(pp + encodeURIComponent(apiUrl), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: file.dataId }),
-        });
-        if (resp.ok) {
-          const text = await resp.text();
-          if (text.trim().startsWith('{') || text.trim().startsWith('[')) {
-            const data = JSON.parse(text);
+    // Try both known API endpoint versions
+    const apiEndpoints = [
+      file.provider.apiEndpoint,                                    // /api/_001_v2
+      file.provider.apiEndpoint.replace('_001_v2', '_001'),        // /api/_001
+    ];
+
+    for (const apiUrl of apiEndpoints) {
+      const result = await tryApiResolve(file, apiUrl);
+      if (result) return result;
+    }
+  }
+
+  // Step 3: If API failed but we have a file page, try fetching via Worker
+  // (the Worker can follow redirects and set Referer)
+  if (file.pageUrl && getWorkerUrl()) {
+    try {
+      const worker = getWorkerUrl();
+      const referer = file.pageUrl;
+      // Try fetching the file page through the worker to get redirect chain
+      const resp = await fetch(`${worker}?url=${encodeURIComponent(file.pageUrl)}&referer=${encodeURIComponent(referer)}`);
+      if (resp.ok) {
+        const html = await resp.text();
+        const directMatch = html.match(/(?:href|src)="(https?:\/\/[^"]*(?:cdn|media-files|burger|gigachad|bunkr-cache|cheese|sushi|bacon|maple|beer|rice|cake|rum|wings)[^"]*)"/);
+        if (directMatch) {
+          file.directUrl = directMatch[1];
+          file._referer = (file.provider && file.provider.refererBase) ? file.provider.refererBase + (file.dataId || file.slug || '') : file.pageUrl;
+          return file.directUrl;
+        }
+      }
+    } catch(e) { /* */ }
+  }
+
+  throw new Error('Could not resolve — ensure Download Worker is configured');
+}
+
+// Fetch the individual file page (/f/{slug}) to extract data-file-id
+async function fetchFilePage(file) {
+  const worker = getWorkerUrl();
+
+  // Prefer Worker (no CORS issues, can follow redirects)
+  if (worker) {
+    try {
+      const resp = await fetch(`${worker}?url=${encodeURIComponent(file.pageUrl)}`);
+      if (resp.ok) {
+        const text = await resp.text();
+        if (text.length > 200) return text;
+      }
+    } catch(e) { /* fall through */ }
+  }
+
+  // Fallback: CORS proxy
+  return await proxyFetchHtml(file.pageUrl);
+}
+
+// Try resolving via a specific API endpoint
+async function tryApiResolve(file, apiUrl) {
+  const postProxies = ['https://corsproxy.io/?url=', getProxyUrl(), 'https://api.allorigins.win/raw?url='];
+  const worker = getWorkerUrl();
+
+  // Also try through the Worker (it can POST)
+  const targets = worker
+    ? [{ url: `${worker}?url=${encodeURIComponent(apiUrl)}`, direct: true }, ...postProxies.map(p => ({ url: p + encodeURIComponent(apiUrl), direct: false }))]
+    : postProxies.map(p => ({ url: p + encodeURIComponent(apiUrl), direct: false }));
+
+  const unique = [];
+  const seen = new Set();
+  for (const t of targets) { if (!seen.has(t.url)) { seen.add(t.url); unique.push(t); } }
+
+  for (const target of unique) {
+    try {
+      const resp = await fetch(target.url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: file.dataId }),
+      });
+      if (resp.ok) {
+        const text = await resp.text();
+        if (text.trim().startsWith('{') || text.trim().startsWith('[')) {
+          const data = JSON.parse(text);
+          if (data.url) {
             let url = data.url;
             if (data.encrypted) {
               const key = 'SECRET_KEY_' + String(Math.floor(data.timestamp / 3600));
@@ -927,22 +1023,10 @@ async function resolveFileUrl(file) {
             return url;
           }
         }
-      } catch(e) { /* try next */ }
-    }
+      }
+    } catch(e) { /* try next */ }
   }
-
-  // Fallback: fetch file page
-  if (file.pageUrl) {
-    try {
-      const html = await proxyFetchHtml(file.pageUrl);
-      const srcMatch = html.match(/(?:href|src)="(https?:\/\/[^"]*(?:cdn|media-files|burger|gigachad|files\.)[^"]*)"/);
-      if (srcMatch) { file.directUrl = srcMatch[1]; return srcMatch[1]; }
-      const fileIdMatch = html.match(/data-file-id="(\d+)"/);
-      if (fileIdMatch) { file.dataId = fileIdMatch[1]; file.provider = file.provider || providers[0]; return resolveFileUrl(file); }
-    } catch(e) { /* */ }
-  }
-
-  throw new Error('Could not resolve download URL — try configuring a Download Worker');
+  return null;
 }
 
 function xorDecrypt(encoded, key) {
