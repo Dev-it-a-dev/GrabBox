@@ -551,9 +551,8 @@ const providers = [
       if (m) return { albumId: m[1], domain: url.match(/(https?:\/\/[^/]+)/)[1] };
       return null;
     },
-    thumbBase: (uuid) => `https://i-burger.bunkr.ru/thumbs/${uuid}.webp`,
-    apiEndpoint: 'https://apidl.bunkr.ru/api/_001_v2',
-    refererBase: 'https://get.bunkrr.su/file/',
+    // The download gateway — file pages contain links like: https://get.bunkrr.su/file/{id}
+    downloadGateway: 'https://get.bunkrr.su',
   },
 ];
 
@@ -611,127 +610,167 @@ async function startFetch() {
 }
 
 async function fetchAlbum(urlInfo) {
-  // === FIX #1: Use ?advanced=1 for full file list (no pagination) ===
-  const advancedUrl = `${urlInfo.domain}/a/${urlInfo.albumId}?advanced=1`;
+  // Try fetching the album page (with and without ?advanced=1)
   let html;
   try {
-    html = await proxyFetchHtml(advancedUrl);
+    html = await proxyFetchHtml(`${urlInfo.domain}/a/${urlInfo.albumId}?advanced=1`);
   } catch(e) {
-    // Fallback: try without advanced param
     html = await proxyFetchHtml(`${urlInfo.domain}/a/${urlInfo.albumId}`);
   }
 
   let files = parseAlbumHtml(html, urlInfo);
 
-  // === FIX #1b: If no files found and no advanced, try pagination ===
-  if (files.length === 0) {
-    files = await fetchAlbumPaginated(urlInfo);
+  // If first page found files, try pagination for more
+  if (files.length > 0) {
+    let page = 2;
+    while (page <= 50) {
+      try {
+        const pageHtml = await proxyFetchHtml(`${urlInfo.domain}/a/${urlInfo.albumId}?page=${page}`);
+        const pageFiles = parseAlbumHtml(pageHtml, urlInfo);
+        if (pageFiles.length === 0) break;
+        if (pageFiles[0] && files.some(f => f.name === pageFiles[0].name)) break; // duplicate detection
+        files = files.concat(pageFiles);
+        page++;
+      } catch(e) { break; }
+    }
   }
 
   return files;
 }
 
-async function fetchAlbumPaginated(urlInfo) {
-  let allParsed = [];
-  let page = 1;
-  const maxPages = 50; // safety limit
-  while (page <= maxPages) {
-    try {
-      const url = `${urlInfo.domain}/a/${urlInfo.albumId}?page=${page}`;
-      const html = await proxyFetchHtml(url);
-      const files = parseAlbumHtml(html, urlInfo);
-      if (files.length === 0) break; // no more pages
-      // Check for duplicates (same name as page 1 = we've looped)
-      if (page > 1 && files[0] && allParsed.some(f => f.name === files[0].name)) break;
-      allParsed = allParsed.concat(files);
-      page++;
-    } catch(e) {
-      break;
-    }
-  }
-  return allParsed;
-}
+// ==================== ALBUM HTML PARSING (2026 structure) ====================
+// The album page is server-rendered HTML cards. Each card has:
+//   - A thumbnail <img> with src on static.scdn.st or i-{food}.bunkr.ru
+//   - The filename as text
+//   - Size and date as text
+//   - The card itself may be wrapped in an <a> linking to /f/{slug}, /v/{slug}, or /i/{slug}
+// We parse using DOMParser to extract all this.
 
 function parseAlbumHtml(html, urlInfo) {
   const files = [];
   const titleMatch = html.match(/property="og:title"\s+content="([^"]+)"/);
   const albumTitle = titleMatch ? decodeHtmlEntities(titleMatch[1]) : urlInfo.albumId;
 
-  // Method 1: Parse window.albumFiles JS array
-  const albumFilesMatch = html.match(/window\.albumFiles\s*=\s*\[([\s\S]*?)\];\s*<\/script>/);
-  if (albumFilesMatch) {
-    const rawEntries = albumFilesMatch[1].split(/\n\},\s*\n/);
-    for (const entry of rawEntries) {
-      try {
-        const file = parseAlbumFileEntry(entry, urlInfo, albumTitle);
-        if (file) files.push(file);
-      } catch(e) { /* skip bad entry */ }
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+
+  // Strategy 1: Find <a> links to file pages (/f/, /v/, /i/, /d/)
+  const fileLinks = doc.querySelectorAll('a[href*="/f/"], a[href*="/v/"], a[href*="/i/"], a[href*="/d/"]');
+  const seenSlugs = new Set();
+
+  fileLinks.forEach(link => {
+    const href = link.getAttribute('href');
+    if (!href) return;
+
+    const slugMatch = href.match(/\/([fvid])\/([^\/?#]+)/);
+    if (!slugMatch) return;
+
+    const fileType = slugMatch[1]; // f, v, i, d
+    const slug = slugMatch[2];
+    if (seenSlugs.has(slug)) return; // avoid duplicates from repeated links
+    seenSlugs.add(slug);
+
+    const fullPageUrl = href.startsWith('http') ? href : urlInfo.domain + href;
+
+    // Find filename — look for text content or nearby text
+    let name = slug;
+    // The link may contain the filename as text, or have a sibling/child with the name
+    const textContent = link.textContent.trim();
+    if (textContent && textContent.length > 2 && textContent.includes('.')) {
+      name = textContent.split('\n').map(s => s.trim()).find(s => s.includes('.')) || slug;
     }
-  }
 
-  // Method 2: Fallback — parse links from HTML
+    // Find thumbnail
+    const img = link.querySelector('img') || (link.closest && link.closest('.relative, .card, .grid-item, [class*=card]')?.querySelector('img'));
+    let thumb = null;
+    if (img) {
+      thumb = img.getAttribute('src') || img.getAttribute('data-src') || null;
+      // Skip icon images
+      if (thumb && (thumb.includes('/images/video.svg') || thumb.includes('/images/image.svg') || thumb.includes('/images/file.svg'))) {
+        thumb = null;
+      }
+    }
+
+    // Try to find size from nearby text
+    let size = 0;
+    let sizeFormatted = '—';
+    const parentCard = link.closest && link.closest('.relative, .card, [class*=card], .grid-cols');
+    if (parentCard) {
+      const sizeMatch = parentCard.textContent.match(/([\d.]+)\s*(KB|MB|GB|B)\b/i);
+      if (sizeMatch) {
+        const val = parseFloat(sizeMatch[1]);
+        const unit = sizeMatch[2].toUpperCase();
+        const mult = { B: 1, KB: 1024, MB: 1048576, GB: 1073741824 };
+        size = Math.round(val * (mult[unit] || 1));
+        sizeFormatted = sizeMatch[1] + ' ' + sizeMatch[2];
+      }
+    }
+
+    const type = getFileType(name);
+
+    files.push({
+      id: generateId(),
+      name: name,
+      slug: slug,
+      type: type,
+      size: size,
+      sizeFormatted: sizeFormatted,
+      thumb: thumb,
+      pageUrl: fullPageUrl,
+      directUrl: null,
+      downloadGatewayUrl: null, // will be resolved from file page
+      albumId: urlInfo.albumId,
+      albumTitle: albumTitle,
+      domain: urlInfo.domain,
+      provider: urlInfo.provider,
+    });
+  });
+
+  // Strategy 2: If no /f/ links found, try to find cards with filenames + thumbnails
+  // (some views may not have direct links but still show file info)
   if (files.length === 0) {
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(html, 'text/html');
-    const links = doc.querySelectorAll('a[href*="/f/"], a[href*="/v/"], a[href*="/i/"], a[href*="/d/"]');
-    links.forEach(link => {
-      const href = link.getAttribute('href');
-      if (!href) return;
-      const fullUrl = href.startsWith('http') ? href : urlInfo.domain + href;
-      const nameMatch = href.match(/\/[fvid]\/(.+)/);
-      const name = nameMatch ? decodeURIComponent(nameMatch[1]) : href.split('/').pop();
-      const type = getFileType(name);
-      const img = link.querySelector('img');
-      const thumb = img ? img.getAttribute('src') || img.getAttribute('data-src') : null;
-      files.push({
-        id: generateId(), name, type, size: 0, sizeFormatted: '—', thumb, pageUrl: fullUrl,
-        directUrl: null, albumId: urlInfo.albumId, albumTitle, slug: name, provider: urlInfo.provider,
-      });
-    });
+    // Look for all thumbnail images and extract info from surrounding elements
+    const thumbImgs = doc.querySelectorAll('img[src*="scdn.st"], img[src*="bunkr.ru/thumbs"]');
+    thumbImgs.forEach(img => {
+      const thumb = img.getAttribute('src');
+      const parent = img.closest('a, .relative, .card, [class*=card]') || img.parentElement?.parentElement;
+      if (!parent) return;
 
-    // Also check for direct CDN links
-    const mediaSrcs = doc.querySelectorAll('img[src*="cdn"], video source[src*="cdn"], img[src*="media-files"], video source[src*="media-files"]');
-    const existingNames = new Set(files.map(f => f.name));
-    mediaSrcs.forEach(el => {
-      const src = el.getAttribute('src');
-      if (!src) return;
-      const name = decodeURIComponent(src.split('/').pop().split('?')[0]);
-      if (existingNames.has(name)) return;
-      existingNames.add(name);
+      const textParts = parent.textContent.trim().split('\n').map(s => s.trim()).filter(s => s);
+      const name = textParts.find(s => s.includes('.') && s.length > 3) || 'unknown';
+      if (seenSlugs.has(name)) return;
+      seenSlugs.add(name);
+
+      // Try to find a link in the parent
+      const link = parent.closest('a') || parent.querySelector('a');
+      let pageUrl = null;
+      if (link) {
+        const href = link.getAttribute('href');
+        if (href && href.match(/\/[fvid]\//)) {
+          pageUrl = href.startsWith('http') ? href : urlInfo.domain + href;
+        }
+      }
+
+      const sizeMatch = parent.textContent.match(/([\d.]+)\s*(KB|MB|GB|B)\b/i);
+      let size = 0, sizeFormatted = '—';
+      if (sizeMatch) {
+        const val = parseFloat(sizeMatch[1]);
+        const unit = sizeMatch[2].toUpperCase();
+        const mult = { B: 1, KB: 1024, MB: 1048576, GB: 1073741824 };
+        size = Math.round(val * (mult[unit] || 1));
+        sizeFormatted = sizeMatch[1] + ' ' + sizeMatch[2];
+      }
+
       files.push({
-        id: generateId(), name, type: getFileType(name), size: 0, sizeFormatted: '—',
-        thumb: getFileType(name) === 'image' ? src : null, pageUrl: null, directUrl: src,
-        albumId: urlInfo.albumId, albumTitle, slug: name, provider: urlInfo.provider,
+        id: generateId(), name, slug: name, type: getFileType(name),
+        size, sizeFormatted, thumb, pageUrl,
+        directUrl: null, downloadGatewayUrl: null,
+        albumId: urlInfo.albumId, albumTitle, domain: urlInfo.domain, provider: urlInfo.provider,
       });
     });
   }
+
   return files;
-}
-
-function parseAlbumFileEntry(entry, urlInfo, albumTitle) {
-  const idMatch = entry.match(/\bid:\s*(\d+)/);
-  const nameMatch = entry.match(/original:\s*'((?:[^'\\]|\\.)*)'/);
-  const slugMatch = entry.match(/slug:\s*'((?:[^'\\]|\\.)*)'/);
-  const sizeMatch = entry.match(/size:\s*(\d+)/);
-  const uuidMatch = entry.match(/name:\s*"([^"]+)"/);
-  if (!idMatch) return null;
-  const albumItemId = idMatch[1]; // This is the album-level ID, NOT the file-level data-file-id
-  const rawName = nameMatch ? nameMatch[1].replace(/\\'/g, "'") : (slugMatch ? slugMatch[1] : albumItemId);
-  const slug = slugMatch ? slugMatch[1].replace(/\\'/g, "'") : rawName;
-  const size = sizeMatch ? parseInt(sizeMatch[1]) : 0;
-  const uuid = uuidMatch ? uuidMatch[1] : null;
-  const type = getFileType(rawName);
-  let thumb = null;
-  if (uuid && (type === 'image' || type === 'video') && urlInfo.provider && urlInfo.provider.thumbBase) {
-    thumb = urlInfo.provider.thumbBase(uuid);
-  }
-  // Build the individual file page URL — this is where we'll find the real data-file-id
-  const filePageUrl = `${urlInfo.domain}/f/${slug}`;
-  return {
-    id: generateId(), dataId: null, slug, name: rawName, type, size, sizeFormatted: formatSize(size),
-    thumb, pageUrl: filePageUrl, directUrl: null, albumId: urlInfo.albumId, albumTitle,
-    domain: urlInfo.domain, provider: urlInfo.provider,
-  };
 }
 
 // ==================== FILE TYPE ====================
@@ -900,79 +939,74 @@ function updateSelectionBar() {
 }
 
 // ==================== RESOLVE DOWNLOAD URL ====================
-// Resolution flow:
-// 1. Fetch individual file page (/f/{slug}) to get the real data-file-id
-// 2. POST data-file-id to API endpoint → get CDN URL
-// 3. CDN URL requires Referer header (handled by Worker)
+// Confirmed resolution flow (2026):
+// 1. Fetch individual file page (/f/{slug} or /v/{slug})
+// 2. Extract download link: https://get.bunkrr.su/file/{numeric_id}
+// 3. That URL is the download gateway — route through Worker with Referer header
+//    The gateway redirects to the actual CDN file.
 
 async function resolveFileUrl(file) {
   if (file.directUrl) return file.directUrl;
 
-  // Step 1: If we don't have the real data-file-id yet, fetch the individual file page
-  if (!file.dataId && file.pageUrl) {
+  // If we already have the gateway URL, use it
+  if (file.downloadGatewayUrl) {
+    file.directUrl = file.downloadGatewayUrl;
+    return file.directUrl;
+  }
+
+  // Step 1: Fetch the individual file page to find the download gateway link
+  if (file.pageUrl) {
     try {
       const html = await fetchFilePage(file);
-      // Extract data-file-id from the file page
+
+      // Look for the download gateway link: https://get.bunkrr.su/file/{id}
+      const gatewayMatch = html.match(/href="(https?:\/\/get\.bunkr[^"]*\/file\/[^"]+)"/);
+      if (gatewayMatch) {
+        file.downloadGatewayUrl = gatewayMatch[1];
+        file.directUrl = gatewayMatch[1];
+        file._referer = file.pageUrl;
+        return file.directUrl;
+      }
+
+      // Fallback: look for any direct CDN link on the page
+      const cdnMatch = html.match(/(?:href|src)="(https?:\/\/[^"]*(?:bunkr\.ru|scdn\.st|bunkr-cache)[^"]*(?:download=true|_source[^"]*))/);
+      if (cdnMatch) {
+        file.directUrl = cdnMatch[1];
+        file._referer = file.pageUrl;
+        return file.directUrl;
+      }
+
+      // Fallback: look for data-file-id and construct gateway URL
       const fileIdMatch = html.match(/data-file-id="([^"]+)"/);
       if (fileIdMatch) {
-        file.dataId = fileIdMatch[1];
+        const gateway = (file.provider && file.provider.downloadGateway) || 'https://get.bunkrr.su';
+        file.downloadGatewayUrl = `${gateway}/file/${fileIdMatch[1]}`;
+        file.directUrl = file.downloadGatewayUrl;
+        file._referer = file.pageUrl;
+        return file.directUrl;
       }
-      // Also look for direct CDN links on the file page as a fallback
-      if (!file.dataId) {
-        const directMatch = html.match(/(?:href|src)="(https?:\/\/[^"]*(?:cdn|media-files|burger|gigachad|bunkr-cache|cheese|sushi|bacon|maple|beer|rice|cake|rum|wings|pad|soup)[^"]*)"/);
-        if (directMatch) {
-          file.directUrl = directMatch[1];
-          file._referer = (file.provider && file.provider.refererBase) ? file.provider.refererBase + (file.slug || '') : file.pageUrl;
-          return file.directUrl;
-        }
+
+      // Fallback: any link that looks like a file download
+      const anyDownload = html.match(/href="(https?:\/\/[^"]+\.(mp4|jpg|jpeg|png|gif|webp|webm|mkv|avi|mov|zip|rar)[^"]*)"/i);
+      if (anyDownload) {
+        file.directUrl = anyDownload[1];
+        file._referer = file.pageUrl;
+        return file.directUrl;
       }
+
     } catch(e) {
-      console.warn('File page fetch failed for', file.name, e.message);
+      console.warn('File page fetch failed for', file.name, ':', e.message);
     }
   }
 
-  // Step 2: Use data-file-id with the API to get the real CDN URL
-  if (file.dataId && file.provider && file.provider.apiEndpoint) {
-    // Try both known API endpoint versions
-    const apiEndpoints = [
-      file.provider.apiEndpoint,                                    // /api/_001_v2
-      file.provider.apiEndpoint.replace('_001_v2', '_001'),        // /api/_001
-    ];
-
-    for (const apiUrl of apiEndpoints) {
-      const result = await tryApiResolve(file, apiUrl);
-      if (result) return result;
-    }
-  }
-
-  // Step 3: If API failed but we have a file page, try fetching via Worker
-  // (the Worker can follow redirects and set Referer)
-  if (file.pageUrl && getWorkerUrl()) {
-    try {
-      const worker = getWorkerUrl();
-      const referer = file.pageUrl;
-      // Try fetching the file page through the worker to get redirect chain
-      const resp = await fetch(`${worker}?url=${encodeURIComponent(file.pageUrl)}&referer=${encodeURIComponent(referer)}`);
-      if (resp.ok) {
-        const html = await resp.text();
-        const directMatch = html.match(/(?:href|src)="(https?:\/\/[^"]*(?:cdn|media-files|burger|gigachad|bunkr-cache|cheese|sushi|bacon|maple|beer|rice|cake|rum|wings)[^"]*)"/);
-        if (directMatch) {
-          file.directUrl = directMatch[1];
-          file._referer = (file.provider && file.provider.refererBase) ? file.provider.refererBase + (file.dataId || file.slug || '') : file.pageUrl;
-          return file.directUrl;
-        }
-      }
-    } catch(e) { /* */ }
-  }
-
-  throw new Error('Could not resolve — ensure Download Worker is configured');
+  throw new Error('Could not resolve — check Worker config and URL');
 }
 
-// Fetch the individual file page (/f/{slug}) to extract data-file-id
+// Fetch the individual file page
 async function fetchFilePage(file) {
   const worker = getWorkerUrl();
 
-  // Prefer Worker (no CORS issues, can follow redirects)
+  // Prefer Worker (handles redirects, no CORS issues)
   if (worker) {
     try {
       const resp = await fetch(`${worker}?url=${encodeURIComponent(file.pageUrl)}`);
@@ -980,63 +1014,11 @@ async function fetchFilePage(file) {
         const text = await resp.text();
         if (text.length > 200) return text;
       }
-    } catch(e) { /* fall through */ }
+    } catch(e) { /* fall through to proxy */ }
   }
 
   // Fallback: CORS proxy
   return await proxyFetchHtml(file.pageUrl);
-}
-
-// Try resolving via a specific API endpoint
-async function tryApiResolve(file, apiUrl) {
-  const postProxies = ['https://corsproxy.io/?url=', getProxyUrl(), 'https://api.allorigins.win/raw?url='];
-  const worker = getWorkerUrl();
-
-  // Also try through the Worker (it can POST)
-  const targets = worker
-    ? [{ url: `${worker}?url=${encodeURIComponent(apiUrl)}`, direct: true }, ...postProxies.map(p => ({ url: p + encodeURIComponent(apiUrl), direct: false }))]
-    : postProxies.map(p => ({ url: p + encodeURIComponent(apiUrl), direct: false }));
-
-  const unique = [];
-  const seen = new Set();
-  for (const t of targets) { if (!seen.has(t.url)) { seen.add(t.url); unique.push(t); } }
-
-  for (const target of unique) {
-    try {
-      const resp = await fetch(target.url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: file.dataId }),
-      });
-      if (resp.ok) {
-        const text = await resp.text();
-        if (text.trim().startsWith('{') || text.trim().startsWith('[')) {
-          const data = JSON.parse(text);
-          if (data.url) {
-            let url = data.url;
-            if (data.encrypted) {
-              const key = 'SECRET_KEY_' + String(Math.floor(data.timestamp / 3600));
-              url = xorDecrypt(url, key);
-            }
-            file.directUrl = url;
-            file._referer = (file.provider.refererBase || '') + file.dataId;
-            return url;
-          }
-        }
-      }
-    } catch(e) { /* try next */ }
-  }
-  return null;
-}
-
-function xorDecrypt(encoded, key) {
-  const keyBytes = new TextEncoder().encode(key);
-  try {
-    const decoded = atob(encoded);
-    let result = '';
-    for (let i = 0; i < decoded.length; i++) result += String.fromCharCode(decoded.charCodeAt(i) ^ keyBytes[i % keyBytes.length]);
-    return result;
-  } catch(e) { return encoded; }
 }
 
 // ==================== DOWNLOAD via WORKER ====================
@@ -1044,7 +1026,7 @@ async function downloadFileBlob(file) {
   const url = await resolveFileUrl(file);
   const worker = getWorkerUrl();
 
-  // Strategy 1: Cloudflare Worker (with Referer header)
+  // Strategy 1: Cloudflare Worker (sets Referer, follows redirects from gateway)
   if (worker) {
     try {
       const params = new URLSearchParams({ url });
@@ -1057,19 +1039,18 @@ async function downloadFileBlob(file) {
     } catch(e) { console.warn('Worker download failed:', e.message); }
   }
 
-  // Strategy 2: Direct fetch (CDN might allow it)
+  // Strategy 2: Direct fetch (in case CDN allows CORS)
   try {
     const resp = await fetch(url, { mode: 'cors' });
     if (resp.ok) {
       const blob = await resp.blob();
       if (validateBlob(blob)) return fixBlobType(blob, file.name);
     }
-  } catch(e) { /* CORS blocked, expected */ }
+  } catch(e) { /* expected CORS block */ }
 
-  // Strategy 3: Through CORS proxies
-  const proxies = [getProxyUrl(), 'https://corsproxy.io/?url=', 'https://api.allorigins.win/raw?url='];
-  const unique = [...new Set(proxies)];
-  for (const p of unique) {
+  // Strategy 3: CORS proxies
+  const proxies = [...new Set([getProxyUrl(), 'https://corsproxy.io/?url=', 'https://api.allorigins.win/raw?url='])];
+  for (const p of proxies) {
     try {
       const resp = await fetch(p + encodeURIComponent(url));
       if (resp.ok) {
